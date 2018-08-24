@@ -1,0 +1,214 @@
+一、DNS服务器安装
+1、安装BIND软件包,为了安全着想(提供假根)才需要安装bind-devel，bind-chroot
+yum install bind bind-utils bind-devel bind-chroot -y
+
+2、查看软件包
+rpm -qa |grep bind
+
+3、编辑主配置文件
+cp /etc/named.conf{,.bak}
+#vi /etc/named.conf
+cat > /etc/named.conf <<EOF 
+options {
+  version "1.1.1";
+  listen-on port 53 {any;};     #监控端口,集群化的时候把any替换为vip
+  directory "/var/named/chroot/etc/";     #A记录等配置文件所在的目录
+  pid-file "/var/named/chroot/var/run/named/named.pid";     #进程号
+  allow-query { any; };     #允许谁访问
+  dump-file "/var/named/chroot/var/log/binddump.db";
+  statistics-file "/var/named/chroot/var/log/named_stats"; #状态文件（可以做监控），可以看到DNS解析记录的数量，成功率等,需要执行rndc stats才会生成。
+  zone-statistics yes;     #配成yes之后，服务器搜集所有zone的统计数据
+  memstatistics-file "log/mem_stats";     #内存状态
+  empty-zones-enable no;
+  forwarders {114.114.114.114;223.6.6.6; };     #转发（如果我这没有域名就转发）
+};
+#认证的密钥
+key "rndc-key" {
+        algorithm hmac-md5;
+        secret "Eqw4hClGExUWeDkKBX/pBg==";
+};
+controls {
+       inet 127.0.0.1 port 953
+               allow { 127.0.0.1; } keys { "rndc-key"; };
+};
+#日志警告路径(日志分2种)
+logging {
+  #异常日志相关信息
+  channel warning {
+    file "/var/named/chroot/var/log/dns_warning" versions 10 size 10m;
+    severity warning;
+    print-category yes;
+    print-severity yes;
+    print-time yes;
+  };
+  #访问日志相关信息
+  channel general_dns {
+    file "/var/named/chroot/var/log/dns_log" versions 10 size 100m;
+    severity info;
+    print-category yes;
+    print-severity yes;
+    print-time yes;
+  };
+  #默认日志警告级别
+  category default {
+    warning;
+  };
+  #访问日志级别
+  category queries {
+    general_dns;
+  };
+};
+#其他域的配置文件目录(view.conf可以实现简单的只能DNS的功能，为以后的只能DNS做准备)
+include "/var/named/chroot/etc/view.conf";
+EOF
+
+4、新建rndc.key认证文件
+#vi /etc/rndc.key
+cat > /etc/rndc.key <<EOF 
+key "rndc-key" {
+        algorithm hmac-md5;
+        secret "Eqw4hClGExUWeDkKBX/pBg==";
+};
+EOF
+
+5、新建rndc.conf配置文件
+#vi /etc/rndc.conf
+cat > /etc/rndc.conf <<EOF 
+key "rndc-key" {
+        algorithm hmac-md5;
+        secret "Eqw4hClGExUWeDkKBX/pBg==";
+};
+options {
+        default-key "rndc-key";
+        default-server 127.0.0.1;
+        default-port 953;
+};
+EOF
+
+6、新建view配置文件
+#vi /var/named/chroot/etc/view.conf
+cat > /var/named/chroot/etc/view.conf <<EOF 
+view "Telecom" {    #view名称，这里配置的是电信的view,联通(Unicom),移动(Mobile),网通(Netcom)
+    zone "test.com" {     #zone配置
+        type    master;   #此处为master还有一个slave
+        file    "test.com.zone";  #通过这个view进行来找file找哪一个
+        allow-transfer {         #允许谁来同步(在named.conf(allow-quey)配置)
+                192.168.10.19;
+        };
+        notify  yes;     #当主DNS配置发生变更了，立即去通知下面的IP
+        also-notify {
+                192.168.10.19;
+        };
+    };
+    zone "168.192.in-addr.arpa" {     #zone配置
+        type    master;   #此处为master还有一个slave
+        file    "168.192.zone";  #通过这个view进行来找file找哪一个
+        allow-transfer {         #允许谁来同步(在named.conf(allow-quey)配置)
+                192.168.10.19;
+        };
+        notify  yes;     #当主DNS配置发生变更了，立即去通知下面的IP
+        also-notify {
+                192.168.10.19;
+        };
+    };
+};
+EOF
+
+检查主配置文件语法,逻辑错误无法检查，没有消息就是最好的消息
+named-checkconf
+
+7、编辑正向解析配置文件
+vi /var/named/chroot/etc/test.com.zone
+$TTL 3600     ;声明一个宏需要前面加$,域名生存周期1小时
+test.com.    IN    SOA    dns.test.com. mail.test.com. (
+            20180224   ; serial(版本号，不能超过10位,如果新同步数据需要调节此处) 
+            900        ; refresh(刷新间隔，从DNS每隔15分钟向主DNS轮询检查区域文件是否变更，从而同步数据)
+            600        ; retry(重试间隔，从DNS超过刷新时间后，无法连接主DNS，每隔10分钟尝试重新连接)
+            86400      ; expire(过期时间，从DNS超过过期时间（1天）后，无法连接主DNS，从DNS使该区失效)
+            3600 )     ; minimum(否定答案的缓存时长，域名所有记录的最小生存时间为1天)
+            IN    NS    dns.test.com.   ;此处A记录的相关信息
+dns            IN    A    192.168.10.18
+@            IN    MX  10    sendmail.test.com.
+sendmail        IN    A    192.168.10.26
+
+
+检查正向解析配置文件语法
+named-checkzone "test.com" /var/named/chroot/etc/test.com.zone
+
+8、编辑反向解析配置文件
+vi /var/named/chroot/etc/168.192.zone
+$TTL 3600     ;声明一个宏需要前面加$,域名生存周期1小时
+@              IN    SOA    dns.test.com. mail.test.com. (
+            20180224   ; serial(版本号，不能超过10位,如果新同步数据需要调节此处) 
+            900        ; refresh(刷新间隔，从DNS每隔15分钟向主DNS轮询检查区域文件是否变更，从而同步数据)
+            600        ; retry(重试间隔，从DNS超过刷新时间后，无法连接主DNS，每隔10分钟尝试重新连接)
+            86400      ; expire(过期时间，从DNS超过过期时间（1天）后，无法连接主DNS，从DNS使该区失效)
+            3600 )     ; minimum(否定答案的缓存时长，域名所有记录的最小生存时间为1天)
+            IN    NS    dns.test.com.   ;此处A记录的相关信息
+26.10        IN    PTR    sendmail.test.com. ;IP反写，实际是192.168.10.26
+
+检查反向解析配置文件语法
+named-checkzone "168.192.in-addr.arpa" /var/named/chroot/etc/168.192.zone
+
+9、修改目录权限，并启动服务
+chown -R named.named /var/named/
+service named start
+service named status
+chkconfig named on
+
+10、测试DNS解析
+测试正向解析结果
+dig @192.168.10.18 dns.test.com
+测试反向解析结果
+host 192.168.10.8 192.168.10.18
+
+二、DNS从服务器安装
+1,2,3,4,5步骤都一样参考主服务器安装
+6、新建view配置文件
+#vi /var/named/chroot/etc/view.conf
+cat > /var/named/chroot/etc/view.conf <<EOF 
+view "Telecom" {    #view名称，这里配置的是电信的view,联通(Unicom),移动(Mobile),网通(Netcom)
+    zone "test.com" {     #zone配置
+        type    slave;   #此处为slave
+        masters {192.168.10.18; };  #可以写多个主,分号分隔
+        file    "slave.test.com.zone";  #通过这个view进行来找file找哪一个
+  };
+    zone "168.192.in-addr.arpa" {     #zone配置
+        type    slave;   #此处为slave
+        masters {192.168.10.18; };  #可以写多个主,分号分隔
+        file    "slave.168.192.zone";  #通过这个view进行来找file找哪一个
+  };
+};
+EOF
+
+7、登陆主DNS服务器，修改主DNS服务器的配置文件的版本号，用来同步配置文件
+vi /var/named/chroot/etc/test.com.zone
+主DNS通过rndc重载服务
+rndc reload
+
+8、登陆从DNS服务器，修改目录权限，并启动服务，此时解析文件已经同步过来了
+chown -R named.named /var/named/
+service named start
+service named status
+chkconfig named on
+ll /var/named/chroot/etc/
+从DNS通过rndc重载服务
+rndc reload
+
+9、测试dns解析结果
+测试正向解析结果
+dig @192.168.10.18 dns.test.com
+dig @192.168.10.19 dns.test.com
+测试反向解析结果
+host 192.168.10.8 192.168.10.18
+host 192.168.10.8 192.168.10.19
+
+三、DNS视图(智能DNS)
+在includ行上面插入
+vi /etc/named.conf
+acl group1 {
+  192.168.10.18;
+};
+acl group2 {
+  192.168.10.19;
+};
